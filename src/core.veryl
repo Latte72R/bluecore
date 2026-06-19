@@ -2,9 +2,10 @@ import eei::*;
 import corectrl::*;
 
 module core (
-    clk   : input   clock                          ,
-    rst   : input   reset                          ,
-    membus: modport membus_if::<ILEN, XLEN>::master,
+    clk     : input   clock                                    ,
+    rst     : input   reset                                    ,
+    i_membus: modport membus_if::<ILEN, XLEN>::master          ,
+    d_membus: modport membus_if::<MEM_DATA_WIDTH, XLEN>::master,
 ) {
     // ifのFIFOのデータ型
     struct if_fifo_type {
@@ -26,6 +27,10 @@ module core (
     var if_pc_requested: Addr ; // 要求したアドレス
     let if_pc_next     : Addr  = if_pc + 4;
 
+    var control_hazard        : logic;
+    var control_hazard_pc_next: Addr ;
+
+
     // フェッチした命令を格納するFIFO
     inst if_fifo: fifo #(
         DATA_TYPE: if_fifo_type,
@@ -33,6 +38,7 @@ module core (
     ) (
         clk                           ,
         rst                           ,
+        flush     : control_hazard    ,
         wready    : if_fifo_wready    ,
         wready_two: if_fifo_wready_two,
         wvalid    : if_fifo_wvalid    ,
@@ -42,15 +48,19 @@ module core (
         rdata     : if_fifo_rdata     ,
     );
 
+    var memu_rdata: UIntX;
+    var memu_stall: logic;
+
     // 命令フェッチ処理
     always_comb {
         // FIFOに2個以上空きがあるとき、命令をフェッチする
-        membus.valid = if_fifo_wready_two;
-        membus.addr  = if_pc;
-        membus.wen   = 0;
-        membus.wdata = 'x; // wdataは使用しない
-        // 常にFIFOから命令を受け取る
-        if_fifo_rready = 1;
+        i_membus.valid = if_fifo_wready_two;
+        i_membus.addr  = if_pc;
+        i_membus.wen   = 0;
+        i_membus.wdata = 'x; // wdataは使用しない
+
+        // memunitが処理中ではないとき、FIFOから命令を取り出していい
+        if_fifo_rready = !memu_stall;
     }
 
     always_ff {
@@ -61,39 +71,46 @@ module core (
             if_fifo_wvalid  = 0;
             if_fifo_wdata   = 0;
         } else {
-            if if_is_requested {
-                if membus.rvalid {
-                    if_is_requested = membus.ready && membus.valid;
-                    if membus.ready && membus.valid {
+            if control_hazard {
+                if_pc           = control_hazard_pc_next;
+                if_is_requested = 0;
+                if_fifo_wvalid  = 0;
+            } else {
+                if if_is_requested {
+                    if i_membus.rvalid {
+                        if_is_requested = i_membus.ready && i_membus.valid;
+                        if i_membus.ready && i_membus.valid {
+                            if_pc           = if_pc_next;
+                            if_pc_requested = if_pc;
+                        }
+                    }
+                } else {
+                    if i_membus.ready && i_membus.valid {
+                        if_is_requested = 1;
                         if_pc           = if_pc_next;
                         if_pc_requested = if_pc;
                     }
                 }
-            } else {
-                if membus.ready && membus.valid {
-                    if_is_requested = 1;
-                    if_pc           = if_pc_next;
-                    if_pc_requested = if_pc;
+                // IFのFIFOの制御
+                if if_is_requested && i_membus.rvalid {
+                    if_fifo_wvalid     = 1;
+                    if_fifo_wdata.addr = if_pc_requested;
+                    if_fifo_wdata.bits = i_membus.rdata;
+                } else {
+                    if if_fifo_wvalid && if_fifo_wready {
+                        if_fifo_wvalid = 0;
+                    }
                 }
             }
         }
-        // IFのFIFOの制御
-        if if_is_requested && membus.rvalid { // ← フェッチできた時
-            if_fifo_wvalid     = 1;
-            if_fifo_wdata.addr = if_pc_requested;
-            if_fifo_wdata.bits = membus.rdata;
-        } else {
-            if if_fifo_wvalid && if_fifo_wready { //← FIFOにデータを格納できる時
-                if_fifo_wvalid = 0;
-            }
-        }
-
     }
 
-    let inst_pc  : Addr     = if_fifo_rdata.addr;
-    let inst_bits: Inst     = if_fifo_rdata.bits;
-    var inst_ctrl: InstCtrl;
-    var inst_imm : UIntX   ;
+    let inst_valid : logic    = if_fifo_rvalid;
+    var inst_is_new: logic   ; // 命令が現在のクロックで供給されたかどうか
+    let inst_pc    : Addr     = if_fifo_rdata.addr;
+    let inst_bits  : Inst     = if_fifo_rdata.bits;
+    var inst_ctrl  : InstCtrl;
+    var inst_imm   : UIntX   ;
 
     inst decoder: inst_decoder ( bits: inst_bits, ctrl: inst_ctrl, imm: inst_imm );
 
@@ -107,22 +124,104 @@ module core (
     let rs1_data: UIntX = if rs1_addr == 0 ? 0 : regfile[rs1_addr];
     let rs2_data: UIntX = if rs2_addr == 0 ? 0 : regfile[rs2_addr];
 
-    // レジスタの初期化
-    always_ff {
-        if_reset {
-            for i in 0..32 {
-                regfile[i] = i;
+    // ALU
+    var op1       : UIntX;
+    var op2       : UIntX;
+    var alu_result: UIntX;
+
+    always_comb {
+        case inst_ctrl.itype {
+            InstType::R, InstType::B: {
+                op1 = rs1_data;
+                op2 = rs2_data;
+            }
+            InstType::I, InstType::S: {
+                op1 = rs1_data;
+                op2 = inst_imm;
+            }
+            InstType::U, InstType::J: {
+                op1 = inst_pc;
+                op2 = inst_imm;
+            }
+            default: {
+                op1 = 'x;
+                op2 = 'x;
             }
         }
     }
 
+    inst alum: alu ( ctrl: inst_ctrl, op1, op2, result: alu_result );
+
+    var brunit_take: logic;
+    inst bru: brunit ( funct3: inst_ctrl.funct3, op1, op2, take: brunit_take );
+
+    assign control_hazard         = inst_valid && (inst_ctrl.is_jump || inst_is_br(inst_ctrl) && brunit_take);
+    assign control_hazard_pc_next = if inst_is_br(inst_ctrl) ? inst_pc + inst_imm : alu_result & ~1;
+
     always_ff {
-        if if_fifo_rvalid {
-            $display("%h : %h", inst_pc, inst_bits);
-            $display("  itype   : %b", inst_ctrl.itype);
-            $display("  imm     : %h", inst_imm);
-            $display("  rs1[%d] : %h", rs1_addr, rs1_data);
-            $display("  rs2[%d] : %h", rs2_addr, rs2_data);
+        if_reset {
+            inst_is_new = 0;
+        } else {
+            if if_fifo_rvalid {
+                inst_is_new = if_fifo_rready;
+            } else {
+                inst_is_new = 1;
+            }
+        }
+    }
+
+    inst memu: memunit (
+        clk                ,
+        rst                ,
+        valid : inst_valid ,
+        is_new: inst_is_new,
+        ctrl  : inst_ctrl  ,
+        addr  : alu_result ,
+        rs2   : rs2_data   ,
+        rdata : memu_rdata ,
+        stall : memu_stall ,
+        membus: d_membus   ,
+    );
+
+    let rd_addr: logic<5> = inst_bits[11:7];
+    let wb_data: UIntX    = switch {
+        inst_ctrl.is_lui : inst_imm,
+        inst_ctrl.is_jump: inst_pc + 4,
+        inst_ctrl.is_load: memu_rdata,
+        default          : alu_result
+    };
+
+    always_ff {
+        if inst_valid && if_fifo_rready && inst_ctrl.rwb_en {
+            regfile[rd_addr] = wb_data;
+        }
+    }
+
+    var clock_count: u64;
+    always_ff {
+        if_reset {
+            clock_count = 1;
+        } else {
+            clock_count = clock_count + 1;
+            if inst_valid {
+                $display("# %d", clock_count);
+                $display("%h : %h", inst_pc, inst_bits);
+                $display("  itype     : %b", inst_ctrl.itype);
+                $display("  imm       : %h", inst_imm);
+                $display("  rs1[%d]   : %h", rs1_addr, rs1_data);
+                $display("  rs2[%d]   : %h", rs2_addr, rs2_data);
+                $display("  op1       : %h", op1);
+                $display("  op2       : %h", op2);
+                $display("  alu res   : %h", alu_result);
+                $display("  mem stall : %b", memu_stall);
+                $display("  mem rdata : %h", memu_rdata);
+                if if_fifo_rready && inst_ctrl.rwb_en {
+                    $display("  reg[%d] <= %h", rd_addr, wb_data);
+                }
+                if inst_is_br(inst_ctrl) {
+                    $display("  br take   : %b", brunit_take);
+                }
+            }
         }
     }
 }
