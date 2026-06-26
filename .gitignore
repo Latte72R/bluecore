@@ -6,3 +6,12 @@
 
 # Verilator
 obj_dir/
+
+# Test
+test/share/
+results/
+
+# Others
+.agents/
+.codex/
+.cache/
