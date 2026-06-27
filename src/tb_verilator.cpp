@@ -1,7 +1,9 @@
 #include "Vcore_top.h"
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdlib.h>
+#include <string>
 #include <verilated.h>
 
 namespace fs = std::filesystem;
@@ -50,6 +52,24 @@ int main(int argc, char **argv) {
 
   // top
   Vcore_top *dut = new Vcore_top();
+
+#ifdef TEST_MODE
+  fs::path dump_path = memory_file_path;
+  dump_path.replace_extension("");
+  dump_path.replace_extension(".dump");
+
+  std::ifstream dump(dump_path);
+  std::string line;
+  while (std::getline(dump, line)) {
+    std::size_t tohost_pos = line.find("<tohost>");
+    if (tohost_pos != std::string::npos) {
+      std::size_t addr_pos = line.rfind('#', tohost_pos);
+      dut->test_tohost_addr =
+          std::stoull(line.substr(addr_pos + 1), nullptr, 16);
+      break;
+    }
+  }
+#endif
 
   // reset
   dut->clk = 0;
