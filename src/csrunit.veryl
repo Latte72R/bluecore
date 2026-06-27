@@ -47,9 +47,9 @@ module csrunit (
     assign trap_vector = if raise_expt ? mtvec : mepc;
 
     // wmasks
-    const MTVEC_WMASK : UIntX = 'hffff_fffc;
-    const MEPC_WMASK  : UIntX = 'hffff_fffc;
-    const MCAUSE_WMASK: UIntX = 'hffff_ffff;
+    const MTVEC_WMASK : UIntX = 'hffff_ffff_ffff_fffc;
+    const MEPC_WMASK  : UIntX = 'hffff_ffff_ffff_fffc;
+    const MCAUSE_WMASK: UIntX = 'hffff_ffff_ffff_ffff;
 
     var wmask: UIntX; // write mask
     var wdata: UIntX; // write data
