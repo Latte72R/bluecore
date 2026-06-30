@@ -110,6 +110,7 @@ module core (
         i_membus.addr  = if_pc;
         i_membus.wen   = 0;
         i_membus.wdata = 'x; // wdataは使用しない
+        i_membus.wmask = 'x; // wmaskは使用しない
     }
 
     always_ff {
